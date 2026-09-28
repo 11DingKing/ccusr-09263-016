@@ -13,7 +13,8 @@ service_09252_008/
 ├── application/       # 应用服务层
 │   ├── ports.py       #   可替换端口：Clock / IdGenerator（测试注入手动时钟与序列 ID）
 │   ├── catalog_service.py  # 目录登记与校验
-│   └── booking_service.py  # 预约状态机：申请/报价/锁定/改期/发运/到货/签到/结算/取消/恢复
+│   ├── booking_service.py  # 预约状态机：申请/报价/锁定/改期/发运/到货/签到/结算/取消/恢复
+│   └── cancellation.py     # 取消补偿编排：按原因选动作、逐动作留痕、失败重试不重复发放
 ├── persistence/       # 持久化层
 │   ├── store.py       #   存储端口 + 内存实现（快照回滚）
 │   └── sqlite_store.py     # SQLite 实现（BEGIN IMMEDIATE，重启可恢复）
@@ -31,6 +32,13 @@ service_09252_008/
 - **锁定**：在单事务内复查互斥并扣减库存，带 TTL；幂等键防止重复占位。
 - **发运后不可移动**：`SHIPPED` 及之后的状态拒绝改期；取消时已发运材料记损耗
   （`cancel_after_shipment`），未发运预占回补库存，并按申请先后释放候补。
+- **取消补偿编排**：取消申请进入补偿流程（`application/cancellation.py`），
+  按取消原因与预约原状态选择补偿动作——回补预占、发运后记损耗、关闭在途发运单、
+  晋级候补、通知导师；安全事件原因额外上报安全负责方，候补放弃不外发通知。
+  每个动作结果（`RUNNING/SUCCEEDED/FAILED` 与尝试次数、错误）逐动作落盘，
+  SQLite 后端重启后仍可查；单个动作失败只记 `FAILED`（部分失败），不影响取消落定，
+  可经 `POST /bookings/{id}/cancel/retry` 仅重试失败动作。
+  已 `SUCCEEDED` 的动作（含已外发通知）在重复取消/重试时一律跳过，补偿不重复发放。
 - **到货**：支持部分到货与在途损耗；发运单未关闭或到货不足时禁止签到。
 - **结算**：按实际出勤折算消耗；国内余料退回库存，跨境余料记损耗
   （`non_returnable_leftover`），课中损坏记 `damaged_in_use`。
@@ -60,7 +68,8 @@ python3 -m service_09252_008 --host 127.0.0.1 --port 8080
 | POST | `/shipments/{id}/losses` | 在途损耗登记 |
 | POST | `/bookings/{id}/checkin` | 签到 |
 | POST | `/bookings/{id}/settle` | 结算（`actual_attendance`、可选 `damaged`） |
-| POST | `/bookings/{id}/cancel` | 取消（释放候补、按规则记损耗） |
+| POST | `/bookings/{id}/cancel` | 取消（按原因编排补偿、逐动作留痕） |
+| POST | `/bookings/{id}/cancel/retry` | 仅重试上次取消中失败的补偿动作 |
 | POST | `/admin/recover` | 恢复超时任务 |
 | GET  | `/bookings/{id}` `/health` | 查询 |
 
@@ -75,7 +84,8 @@ python3 -m unittest discover -s tests -v
 
 覆盖：主流程端到端、前置培训/容量/安全/互斥/运输周期规则、跨时区、
 幂等重放、并发锁定（内存与 SQLite 双后端）、重启后超时恢复、
-部分到货与在途损耗、取消释放候补与损耗记录、HTTP 接口边界。
+部分到货与在途损耗、取消补偿编排（按原因选动作、部分失败、SQLite 落盘后
+跨进程重试、重复取消不重复发放）、HTTP 接口边界。
 
 ## 编译检查
 

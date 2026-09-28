@@ -22,13 +22,21 @@ def make_services(
     now: datetime = NOW,
     lock_ttl_seconds: int = 1800,
     quote_ttl_seconds: int = 86400,
+    notification_port: Any | None = None,
 ) -> tuple[CatalogService, BookingService, ManualClock, Store]:
     """构建注入手动时钟与序列 ID 的服务对。"""
     store = store or InMemoryStore()
     clock = ManualClock(now)
     ids = SequentialIdGenerator()
     catalog = CatalogService(store, clock, ids)
-    bookings = BookingService(store, clock, ids, lock_ttl_seconds=lock_ttl_seconds, quote_ttl_seconds=quote_ttl_seconds)
+    bookings = BookingService(
+        store,
+        clock,
+        ids,
+        lock_ttl_seconds=lock_ttl_seconds,
+        quote_ttl_seconds=quote_ttl_seconds,
+        notification_port=notification_port,
+    )
     return catalog, bookings, clock, store
 
 
@@ -145,3 +153,31 @@ def batch_available(store: Store, batch_id: str) -> float:
 
 def event_types(view: dict[str, Any]) -> list[str]:
     return [e["type"] for e in view["events"]]
+
+
+class FlakyNotificationPort:
+    """模拟取消通知端口：前 N 次调用抛错，之后成功，并统计调用/送达次数。"""
+
+    def __init__(self, *, fail_mentor_times: int = 0, fail_escalation_times: int = 0) -> None:
+        self._fail_mentor = fail_mentor_times
+        self._fail_escalation = fail_escalation_times
+        self.mentor_calls: list[tuple[str, str, str]] = []
+        self.escalation_calls: list[tuple[str, str]] = []
+        self.delivered_mentor = 0
+        self.delivered_escalation = 0
+
+    def notify_mentor_cancelled(self, booking_id: str, mentor_id: str, reason: str) -> dict[str, Any]:
+        self.mentor_calls.append((booking_id, mentor_id, reason))
+        if self._fail_mentor > 0:
+            self._fail_mentor -= 1
+            raise RuntimeError("mentor gateway unavailable")
+        self.delivered_mentor += 1
+        return {"channel": "sms", "delivery_no": f"M{self.delivered_mentor}"}
+
+    def escalate_safety(self, booking_id: str, reason: str, detail: dict[str, Any]) -> dict[str, Any]:
+        self.escalation_calls.append((booking_id, reason))
+        if self._fail_escalation > 0:
+            self._fail_escalation -= 1
+            raise RuntimeError("safety hotline unavailable")
+        self.delivered_escalation += 1
+        return {"channel": "hotline", "ticket_no": f"S{self.delivered_escalation}"}

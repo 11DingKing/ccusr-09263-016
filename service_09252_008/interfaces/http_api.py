@@ -137,6 +137,11 @@ def build_router(catalog: CatalogService, bookings: BookingService) -> _Router:
         "/bookings/{booking_id}/cancel",
         lambda body, hdr: bookings.cancel(hdr["__path__"]["booking_id"], with_idempotency_key(body, hdr)),
     )
+    router.add(
+        "POST",
+        "/bookings/{booking_id}/cancel/retry",
+        lambda body, hdr: bookings.retry_cancel_compensation(hdr["__path__"]["booking_id"]),
+    )
     router.add("POST", "/admin/recover", lambda body, hdr: bookings.recover())
     router.add("GET", "/health", lambda body, hdr: {"status": "ok"})
     return router

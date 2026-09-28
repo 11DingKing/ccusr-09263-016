@@ -57,6 +57,18 @@ from ..domain.rules import (
     safety_ceiling,
 )
 from ..persistence.store import Store
+from .cancellation import (
+    ACTION_CLOSE_SHIPMENTS,
+    ACTION_ESCALATE_SAFETY,
+    ACTION_NOTIFY_MENTOR,
+    ACTION_PROMOTE_WAITLIST,
+    ACTION_RELEASE_RESERVATIONS,
+    ACTION_WRITE_OFF_SHIPPED,
+    CompensationOrchestrator,
+    LoggingNotificationPort,
+    NotificationPort,
+    list_compensation_records,
+)
 from .catalog_service import (
     COLLECTION_BATCHES,
     COLLECTION_MENTORS,
@@ -95,12 +107,15 @@ class BookingService:
         *,
         lock_ttl_seconds: int = DEFAULT_LOCK_TTL_SECONDS,
         quote_ttl_seconds: int = DEFAULT_QUOTE_TTL_SECONDS,
+        notification_port: NotificationPort | None = None,
     ) -> None:
         self._store = store
         self._clock = clock
         self._ids = ids
         self._lock_ttl = lock_ttl_seconds
         self._quote_ttl = quote_ttl_seconds
+        self._notifications = notification_port or LoggingNotificationPort(store, clock, ids)
+        self._orchestrator = CompensationOrchestrator(store, clock, ids)
 
     # ------------------------------------------------------------------
     # 基础设施
@@ -852,18 +867,95 @@ class BookingService:
                 "booking in current status cannot be cancelled",
                 details={"booking_id": booking_id, "status": booking.status.value},
             )
-        reason = request.get("reason")
-        if booking.status == BookingStatus.LOCKED:
-            self._release_reservations(booking)
-        elif booking.status == BookingStatus.SHIPPED:
-            self._write_off_shipped_materials(booking)
+        original_status = booking.status
+        raw_reason = request.get("reason")
+        reason = self._orchestrator.policy.normalize_reason(raw_reason)
+        mentor = self._load_mentor(booking.mentor_id)
+        handlers = self._compensation_handlers(booking, mentor.mentor_id, reason)
+
         booking.status = BookingStatus.CANCELLED
         booking.lock_expires_at = None
         self._save_booking(booking)
-        self._emit("booking_cancelled", booking_id, {"reason": reason})
-        # 容量/互斥资源可能已释放，按规则尝试晋级候补（无候补时为 no-op）
-        self._promote_waitlist(booking.window_id)
-        return self._booking_view(booking)
+        self._emit("booking_cancelled", booking_id, {"reason": reason, "raw_reason": raw_reason})
+        # 进入“取消补偿编排”：按原因与原状态选择动作，逐动作留痕；
+        # 单个动作失败只记 FAILED，不影响取消落定，可事后重试。
+        summary = self._orchestrator.run(
+            booking_id=booking_id,
+            reason=reason,
+            status=original_status,
+            handlers=handlers,
+        )
+        view = self._booking_view(booking)
+        view["compensation_summary"] = summary
+        return view
+
+    def retry_cancel_compensation(self, booking_id: str) -> dict[str, Any]:
+        """重试上次取消中失败的补偿动作；已成功动作跳过，不重复发放。"""
+        with self._store.transaction():
+            booking = self._load_booking(booking_id)
+            if booking.status != BookingStatus.CANCELLED:
+                raise StateError(
+                    "only a CANCELLED booking can retry compensation",
+                    details={"booking_id": booking_id, "status": booking.status.value},
+                )
+            records = list_compensation_records(self._store, booking_id)
+            if not records:
+                raise StateError(
+                    "no compensation has been recorded for this booking",
+                    details={"booking_id": booking_id},
+                )
+            failed = [r["action"] for r in records if r["status"] == "FAILED"]
+            if not failed:
+                raise StateError(
+                    "no failed compensation action to retry",
+                    details={"booking_id": booking_id},
+                )
+            reason = records[0]["reason"]
+            mentor = self._load_mentor(booking.mentor_id)
+            handlers = self._compensation_handlers(booking, mentor.mentor_id, reason)
+            summary = self._orchestrator.retry_failed(booking_id=booking_id, handlers=handlers)
+            self._emit("cancel_compensation_retried", booking_id, {"failed": summary["failed"]})
+            view = self._booking_view(booking)
+            view["compensation_summary"] = summary
+            return view
+
+    def _compensation_handlers(
+        self, booking: Booking, mentor_id: str, reason: str
+    ) -> dict[str, Callable[[], dict[str, Any] | None]]:
+        """构造取消补偿动作处理器；各处理器均天然幂等，可安全重试。"""
+        booking_id = booking.booking_id
+
+        def release_reservations() -> dict[str, Any]:
+            self._release_reservations(booking)
+            return {}
+
+        def write_off_shipped() -> dict[str, Any]:
+            return {"losses": self._write_off_shipped_materials(booking)}
+
+        def close_shipments() -> dict[str, Any]:
+            return {"closed_shipments": self._close_open_shipments(booking)}
+
+        def promote_waitlist() -> dict[str, Any]:
+            return {"promoted": self._promote_waitlist(booking.window_id)}
+
+        def notify_mentor() -> dict[str, Any]:
+            return self._notifications.notify_mentor_cancelled(booking_id, mentor_id, reason)
+
+        def escalate_safety() -> dict[str, Any]:
+            return self._notifications.escalate_safety(
+                booking_id,
+                reason,
+                {"window_id": booking.window_id, "resource_id": booking.resource_id},
+            )
+
+        return {
+            ACTION_RELEASE_RESERVATIONS: release_reservations,
+            ACTION_WRITE_OFF_SHIPPED: write_off_shipped,
+            ACTION_CLOSE_SHIPMENTS: close_shipments,
+            ACTION_PROMOTE_WAITLIST: promote_waitlist,
+            ACTION_NOTIFY_MENTOR: notify_mentor,
+            ACTION_ESCALATE_SAFETY: escalate_safety,
+        }
 
     def _release_reservations(self, booking: Booking) -> None:
         """释放未发运的预占库存。"""
@@ -877,8 +969,13 @@ class BookingService:
             reservation.quantity_released = round(reservation.quantity_released + outstanding, 6)
             self._store.put(COLLECTION_RESERVATIONS, reservation.reservation_id, reservation.to_dict())
 
-    def _write_off_shipped_materials(self, booking: Booking) -> None:
-        """发运后取消：已发运（在途+已到货）材料全部记损耗。"""
+    def _write_off_shipped_materials(self, booking: Booking) -> list[dict[str, Any]]:
+        """发运后取消：已发运（在途+已到货）未核销材料全部记损耗。
+
+        未发运的预占同时回补库存；幂等：已记损耗的数量在重试时计入
+        ``quantity_lost``，不会重复核算。
+        """
+        recorded: list[dict[str, Any]] = []
         for reservation in self._reservations_of(booking.booking_id):
             unshipped = reservation.outstanding_reserved
             if unshipped > QTY_EPS:
@@ -899,23 +996,34 @@ class BookingService:
                     quantity=shipped_uncounted,
                     reason=LOSS_CANCEL_AFTER_SHIPMENT,
                 )
+                recorded.append(
+                    {"material_id": reservation.material_id, "quantity": round(shipped_uncounted, 6)}
+                )
             self._store.put(COLLECTION_RESERVATIONS, reservation.reservation_id, reservation.to_dict())
-        # 关闭仍在途的发运单
-        for shipment in self._shipments_of(booking.booking_id):
-            if not shipment.closed:
-                shipment.status = ShipmentStatus.CLOSED_WITH_LOSS
-                shipment.lost_quantity = round(shipment.lost_quantity + shipment.remaining, 6)
-                self._store.put(COLLECTION_SHIPMENTS, shipment.shipment_id, shipment.to_dict())
+        return recorded
 
-    def _promote_waitlist(self, window_id: str) -> None:
+    def _close_open_shipments(self, booking: Booking) -> list[str]:
+        """关闭仍在途的发运单，剩余数量记在途灭失；已关闭者跳过。"""
+        closed: list[str] = []
+        for shipment in self._shipments_of(booking.booking_id):
+            if shipment.closed:
+                continue
+            shipment.status = ShipmentStatus.CLOSED_WITH_LOSS
+            shipment.lost_quantity = round(shipment.lost_quantity + shipment.remaining, 6)
+            self._store.put(COLLECTION_SHIPMENTS, shipment.shipment_id, shipment.to_dict())
+            closed.append(shipment.shipment_id)
+        return closed
+
+    def _promote_waitlist(self, window_id: str) -> list[str]:
         """按申请先后顺序释放候补：容量与互斥均满足者晋级为 REQUESTED。"""
         window = self._load_window(window_id)
         waiting = sorted(
             (b for b in self._window_bookings(window_id) if b.status == BookingStatus.WAITLISTED),
             key=lambda b: (b.created_at, b.booking_id),
         )
+        promoted: list[str] = []
         if not waiting:
-            return
+            return promoted
         for candidate in waiting:
             others = [
                 (b, self._load_resource(b.resource_id))
@@ -932,6 +1040,8 @@ class BookingService:
             candidate.waitlist_reason = None
             self._save_booking(candidate)
             self._emit("waitlist_promoted", candidate.booking_id, {"window_id": window_id})
+            promoted.append(candidate.booking_id)
+        return promoted
 
     def _record_loss(self, *, booking_id: str | None, batch_id: str, material_id: str, quantity: float, reason: str) -> None:
         loss = LossRecord(
@@ -1011,6 +1121,7 @@ class BookingService:
         view["settlement"] = settlements[0] if settlements else None
         losses = self._store.query(COLLECTION_LOSSES, booking_id=booking.booking_id)
         view["losses"] = losses
+        view["compensation"] = list_compensation_records(self._store, booking.booking_id)
         events = [e for e in self._store.query(COLLECTION_EVENTS, booking_id=booking.booking_id)]
         events.sort(key=lambda e: (e["created_at"], e["event_id"]))
         view["events"] = events
