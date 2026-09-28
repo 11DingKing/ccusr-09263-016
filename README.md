@@ -13,7 +13,8 @@ service_09252_008/
 ├── application/       # 应用服务层
 │   ├── ports.py       #   可替换端口：Clock / IdGenerator（测试注入手动时钟与序列 ID）
 │   ├── catalog_service.py  # 目录登记与校验
-│   └── booking_service.py  # 预约状态机：申请/报价/锁定/改期/发运/到货/签到/结算/取消/恢复
+│   ├── booking_service.py  # 预约状态机：申请/报价/锁定/改期/发运/到货/签到/结算/取消/恢复
+│   └── compensation.py     # 取消补偿编排：按原因选动作、逐动作落库、失败可续跑
 ├── persistence/       # 持久化层
 │   ├── store.py       #   存储端口 + 内存实现（快照回滚）
 │   └── sqlite_store.py     # SQLite 实现（BEGIN IMMEDIATE，重启可恢复）
@@ -31,6 +32,13 @@ service_09252_008/
 - **锁定**：在单事务内复查互斥并扣减库存，带 TTL；幂等键防止重复占位。
 - **发运后不可移动**：`SHIPPED` 及之后的状态拒绝改期；取消时已发运材料记损耗
   （`cancel_after_shipment`），未发运预占回补库存，并按申请先后释放候补。
+- **取消补偿编排**：取消进入补偿流程，按取消原因（`plan_change` /
+  `institution_closed` / `material_shortage` / `force_majeure` /
+  `mentor_unavailable`，兼容中文原因）选择补偿动作——退款、补偿券（报价金额 10%）、
+  通知。每个动作的结果（`SUCCEEDED` / `FAILED` / `SKIPPED`）逐动作独立事务落
+  `compensation_actions`（SQLite 可跨重启），部分动作失败不回滚取消与已成功发放；
+  已成功动作凭持久化记录幂等跳过，**重复取消绝不二次发放**；外部边界恢复后
+  `POST /bookings/{id}/compensation/retry` 只续跑未成功动作。
 - **到货**：支持部分到货与在途损耗；发运单未关闭或到货不足时禁止签到。
 - **结算**：按实际出勤折算消耗；国内余料退回库存，跨境余料记损耗
   （`non_returnable_leftover`），课中损坏记 `damaged_in_use`。
@@ -60,7 +68,8 @@ python3 -m service_09252_008 --host 127.0.0.1 --port 8080
 | POST | `/shipments/{id}/losses` | 在途损耗登记 |
 | POST | `/bookings/{id}/checkin` | 签到 |
 | POST | `/bookings/{id}/settle` | 结算（`actual_attendance`、可选 `damaged`） |
-| POST | `/bookings/{id}/cancel` | 取消（释放候补、按规则记损耗） |
+| POST | `/bookings/{id}/cancel` | 取消（释放候补、按规则记损耗、按原因触发补偿编排） |
+| POST | `/bookings/{id}/compensation/retry` | 续跑未成功的补偿动作（已成功者不重复发放） |
 | POST | `/admin/recover` | 恢复超时任务 |
 | GET  | `/bookings/{id}` `/health` | 查询 |
 

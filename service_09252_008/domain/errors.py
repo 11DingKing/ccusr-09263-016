@@ -61,3 +61,9 @@ class BookingImmutableError(StateError):
     """预约已不可变更（材料已发运或流程已终结）。"""
 
     code = "booking_immutable"
+
+
+class CompensationDeliveryError(DomainError):
+    """补偿动作的外部边界（退款/补偿券/通知）发放失败，动作记 FAILED 后可重试。"""
+
+    code = "compensation_delivery_failed"

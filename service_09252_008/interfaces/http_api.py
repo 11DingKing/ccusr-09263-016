@@ -21,6 +21,7 @@ from ..application.catalog_service import (
 )
 from ..domain.errors import (
     BusinessRuleError,
+    CompensationDeliveryError,
     ConflictError,
     DomainError,
     IdempotencyConflict,
@@ -36,6 +37,7 @@ _ERROR_STATUS = {
     StateError.code: 409,
     ConflictError.code: 409,
     IdempotencyConflict.code: 409,
+    CompensationDeliveryError.code: 502,
 }
 
 HandlerFn = Callable[[dict[str, Any], dict[str, str]], Any]
@@ -136,6 +138,11 @@ def build_router(catalog: CatalogService, bookings: BookingService) -> _Router:
         "POST",
         "/bookings/{booking_id}/cancel",
         lambda body, hdr: bookings.cancel(hdr["__path__"]["booking_id"], with_idempotency_key(body, hdr)),
+    )
+    router.add(
+        "POST",
+        "/bookings/{booking_id}/compensation/retry",
+        lambda body, hdr: bookings.retry_compensation(hdr["__path__"]["booking_id"]),
     )
     router.add("POST", "/admin/recover", lambda body, hdr: bookings.recover())
     router.add("GET", "/health", lambda body, hdr: {"status": "ok"})

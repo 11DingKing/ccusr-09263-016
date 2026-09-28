@@ -6,6 +6,7 @@ from typing import Any
 
 from service_09252_008.application.booking_service import BookingService
 from service_09252_008.application.catalog_service import CatalogService
+from service_09252_008.application.compensation import CompensationGateway, LedgerCompensationGateway
 from service_09252_008.application.ports import ManualClock, SequentialIdGenerator
 from service_09252_008.persistence.store import InMemoryStore, Store
 
@@ -22,13 +23,21 @@ def make_services(
     now: datetime = NOW,
     lock_ttl_seconds: int = 1800,
     quote_ttl_seconds: int = 86400,
+    compensation_gateway: CompensationGateway | None = None,
 ) -> tuple[CatalogService, BookingService, ManualClock, Store]:
     """构建注入手动时钟与序列 ID 的服务对。"""
     store = store or InMemoryStore()
     clock = ManualClock(now)
     ids = SequentialIdGenerator()
     catalog = CatalogService(store, clock, ids)
-    bookings = BookingService(store, clock, ids, lock_ttl_seconds=lock_ttl_seconds, quote_ttl_seconds=quote_ttl_seconds)
+    bookings = BookingService(
+        store,
+        clock,
+        ids,
+        lock_ttl_seconds=lock_ttl_seconds,
+        quote_ttl_seconds=quote_ttl_seconds,
+        compensation_gateway=compensation_gateway,
+    )
     return catalog, bookings, clock, store
 
 

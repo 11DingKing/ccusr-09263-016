@@ -16,6 +16,7 @@ from typing import Any, Callable
 from ..domain.errors import (
     BookingImmutableError,
     BusinessRuleError,
+    CompensationDeliveryError,
     ConflictError,
     IdempotencyConflict,
     NotFoundError,
@@ -64,6 +65,12 @@ from .catalog_service import (
     COLLECTION_RESOURCES,
     COLLECTION_WINDOWS,
 )
+from .compensation import (
+    CompensationGateway,
+    CompensationOrchestrator,
+    LedgerCompensationGateway,
+    normalize_cancel_reason,
+)
 from .ports import Clock, IdGenerator
 
 COLLECTION_BOOKINGS = "bookings"
@@ -95,12 +102,25 @@ class BookingService:
         *,
         lock_ttl_seconds: int = DEFAULT_LOCK_TTL_SECONDS,
         quote_ttl_seconds: int = DEFAULT_QUOTE_TTL_SECONDS,
+        compensation_gateway: CompensationGateway | None = None,
     ) -> None:
         self._store = store
         self._clock = clock
         self._ids = ids
         self._lock_ttl = lock_ttl_seconds
         self._quote_ttl = quote_ttl_seconds
+        self._compensation = CompensationOrchestrator(
+            store, clock, ids, gateway=compensation_gateway or LedgerCompensationGateway()
+        )
+
+    @property
+    def compensation(self) -> CompensationOrchestrator:
+        """取消补偿编排器：供重试失败动作与查询动作结果使用。"""
+        return self._compensation
+
+    def set_compensation_gateway(self, gateway: CompensationGateway) -> None:
+        """替换补偿外部边界（测试注入失败/恢复的网关）。"""
+        self._compensation.set_gateway(gateway)
 
     # ------------------------------------------------------------------
     # 基础设施
@@ -124,14 +144,45 @@ class BookingService:
         fn: Callable[[], dict[str, Any]],
         *,
         required: bool,
+        after_commit: Callable[[dict[str, Any]], dict[str, Any]] | None = None,
     ) -> dict[str, Any]:
-        """幂等执行：键命中且载荷一致则重放首次结果。"""
+        """幂等执行：键命中且载荷一致则重放首次结果。
+
+        ``after_commit`` 在主事务提交后运行（用于取消补偿等需独立持久化、
+        不能被主事务回滚带走的副作用）；其最终结果才写入幂等记录。
+        未提供钩子时保持单事务路径：幂等记录与业务写入同事务，串行化同键并发。
+        """
         if key is None:
             if required:
                 raise ValidationError("idempotency_key is required for this operation")
             with self._store.transaction():
-                return fn()
+                result = fn()
+            return after_commit(result) if after_commit is not None else result
         fingerprint = hashlib.sha256(_canonical(payload).encode("utf-8")).hexdigest()
+        if after_commit is None:
+            with self._store.transaction():
+                existing = self._store.get(COLLECTION_IDEMPOTENCY, key)
+                if existing is not None:
+                    if existing["endpoint"] != endpoint or existing["request_hash"] != fingerprint:
+                        raise IdempotencyConflict(
+                            "idempotency key was already used with a different request",
+                            details={"key": key, "endpoint": endpoint},
+                        )
+                    return {**existing["response"], "idempotent_replay": True}
+                result = fn()
+                self._store.put(
+                    COLLECTION_IDEMPOTENCY,
+                    key,
+                    {
+                        "key": key,
+                        "endpoint": endpoint,
+                        "request_hash": fingerprint,
+                        "response": result,
+                        "created_at": dt_to_str(self._clock.now()),
+                    },
+                )
+                return result
+        # 提交后副作用路径：主流程先提交，副作用独立持久化，再登记幂等记录。
         with self._store.transaction():
             existing = self._store.get(COLLECTION_IDEMPOTENCY, key)
             if existing is not None:
@@ -142,6 +193,8 @@ class BookingService:
                     )
                 return {**existing["response"], "idempotent_replay": True}
             result = fn()
+        final = after_commit(result)
+        with self._store.transaction():
             self._store.put(
                 COLLECTION_IDEMPOTENCY,
                 key,
@@ -149,11 +202,11 @@ class BookingService:
                     "key": key,
                     "endpoint": endpoint,
                     "request_hash": fingerprint,
-                    "response": result,
+                    "response": final,
                     "created_at": dt_to_str(self._clock.now()),
                 },
             )
-            return result
+        return final
 
     # ------------------------------------------------------------------
     # 读取辅助
@@ -843,27 +896,63 @@ class BookingService:
             {"booking_id": booking_id, **request},
             lambda: self._cancel(booking_id, request),
             required=False,
+            after_commit=lambda marker: self._run_cancel_compensation(marker["booking_id"]),
         )
 
     def _cancel(self, booking_id: str, request: dict[str, Any]) -> dict[str, Any]:
+        raw_reason = request.get("reason")
+        reason = normalize_cancel_reason(raw_reason)
+        # 取消主流程（状态、库存/损耗、候补释放）在单事务内完成；
+        # 事务由 _idempotent 外层在本函数返回后提交，补偿在提交后才执行。
         booking = self._load_booking(booking_id)
         if booking.status not in CANCELLABLE_STATUSES:
             raise StateError(
                 "booking in current status cannot be cancelled",
                 details={"booking_id": booking_id, "status": booking.status.value},
             )
-        reason = request.get("reason")
         if booking.status == BookingStatus.LOCKED:
             self._release_reservations(booking)
         elif booking.status == BookingStatus.SHIPPED:
             self._write_off_shipped_materials(booking)
         booking.status = BookingStatus.CANCELLED
         booking.lock_expires_at = None
+        booking.cancel_reason = reason
         self._save_booking(booking)
         self._emit("booking_cancelled", booking_id, {"reason": reason})
         # 容量/互斥资源可能已释放，按规则尝试晋级候补（无候补时为 no-op）
         self._promote_waitlist(booking.window_id)
-        return self._booking_view(booking)
+        return {"booking_id": booking_id}
+
+    def _run_cancel_compensation(self, booking_id: str) -> dict[str, Any]:
+        """取消主事务提交后运行补偿编排：动作结果独立落库，部分失败不回滚取消。"""
+        booking = self._load_booking(booking_id)
+        warning: dict[str, Any] | None = None
+        try:
+            self._compensation.run(booking, booking.cancel_reason)
+        except CompensationDeliveryError as exc:
+            warning = {"error": exc.code, "message": exc.message, "details": exc.details}
+        view = self._booking_view(booking)
+        if warning is not None:
+            view["compensation_warning"] = warning
+        return view
+
+    def retry_compensation(self, booking_id: str) -> dict[str, Any]:
+        """重试某次取消中未成功的补偿动作；已成功者绝不重复发放。"""
+        booking = self._load_booking(booking_id)
+        if booking.status != BookingStatus.CANCELLED:
+            raise StateError(
+                "compensation retry is only available for CANCELLED bookings",
+                details={"booking_id": booking_id, "status": booking.status.value},
+            )
+        warning: dict[str, Any] | None = None
+        try:
+            self._compensation.run(booking, booking.cancel_reason)
+        except CompensationDeliveryError as exc:
+            warning = {"error": exc.code, "message": exc.message, "details": exc.details}
+        view = self._booking_view(booking)
+        if warning is not None:
+            view["compensation_warning"] = warning
+        return view
 
     def _release_reservations(self, booking: Booking) -> None:
         """释放未发运的预占库存。"""
@@ -1011,6 +1100,7 @@ class BookingService:
         view["settlement"] = settlements[0] if settlements else None
         losses = self._store.query(COLLECTION_LOSSES, booking_id=booking.booking_id)
         view["losses"] = losses
+        view["compensation_actions"] = [r.to_dict() for r in self._compensation.list_results(booking.booking_id)]
         events = [e for e in self._store.query(COLLECTION_EVENTS, booking_id=booking.booking_id)]
         events.sort(key=lambda e: (e["created_at"], e["event_id"]))
         view["events"] = events

@@ -106,6 +106,47 @@ LOSS_IN_TRANSIT = "in_transit_loss"  # 在途灭失
 LOSS_DAMAGED_IN_USE = "damaged_in_use"  # 课中损坏
 LOSS_NON_RETURNABLE_LEFTOVER = "non_returnable_leftover"  # 跨境余料不可退回
 
+#: 取消原因（取消补偿编排据此选择补偿动作）
+CANCEL_REASON_PLAN_CHANGE = "plan_change"  # 申请方计划变更
+CANCEL_REASON_INSTITUTION_CLOSED = "institution_closed"  # 院校临时停课
+CANCEL_REASON_MATERIAL_SHORTAGE = "material_shortage"  # 材料不足无法开课
+CANCEL_REASON_FORCE_MAJEURE = "force_majeure"  # 不可抗力
+CANCEL_REASON_MENTOR_UNAVAILABLE = "mentor_unavailable"  # 导师无法到场
+CANCEL_REASON_DEFAULT = "unspecified"  # 未指明原因
+
+#: 允许的取消原因（未传 reason 时归入“未指明”，不阻断取消）
+CANCEL_REASONS = frozenset(
+    {
+        CANCEL_REASON_PLAN_CHANGE,
+        CANCEL_REASON_INSTITUTION_CLOSED,
+        CANCEL_REASON_MATERIAL_SHORTAGE,
+        CANCEL_REASON_FORCE_MAJEURE,
+        CANCEL_REASON_MENTOR_UNAVAILABLE,
+        CANCEL_REASON_DEFAULT,
+    }
+)
+
+#: 取消原因到存储值的别名：兼容中文原因输入，未知值原样保留并按“未指明”编排
+CANCEL_REASON_ALIASES = {
+    "计划变更": CANCEL_REASON_PLAN_CHANGE,
+    "院校临时停课": CANCEL_REASON_INSTITUTION_CLOSED,
+    "材料不足": CANCEL_REASON_MATERIAL_SHORTAGE,
+    "不可抗力": CANCEL_REASON_FORCE_MAJEURE,
+    "导师无法到场": CANCEL_REASON_MENTOR_UNAVAILABLE,
+}
+
+#: 补偿动作类型
+COMP_ACTION_REFUND = "refund"  # 退还已预收款项
+COMP_ACTION_VOUCHER = "compensation_voucher"  # 发放补偿券
+COMP_ACTION_NOTIFY = "notify"  # 通知相关方
+
+COMP_ACTION_TYPES = frozenset({COMP_ACTION_REFUND, COMP_ACTION_VOUCHER, COMP_ACTION_NOTIFY})
+
+#: 补偿动作执行结果状态
+COMP_STATUS_SUCCEEDED = "SUCCEEDED"
+COMP_STATUS_FAILED = "FAILED"
+COMP_STATUS_SKIPPED = "SKIPPED"  # 前置发放失败时跳过
+
 
 # ---------------------------------------------------------------------------
 # 课程包 / 导师 / 工坊资源 / 材料批次 / 接待窗口
@@ -397,6 +438,7 @@ class Booking:
     quote: Quote | None = None
     lock_expires_at: datetime | None = None
     waitlist_reason: str | None = None
+    cancel_reason: str | None = None  # 取消原因（归一化代码值），补偿编排据此选动作
     version: int = 0
 
     def to_dict(self) -> dict[str, Any]:
@@ -417,6 +459,7 @@ class Booking:
             "quote": self.quote.to_dict() if self.quote else None,
             "lock_expires_at": dt_to_str(self.lock_expires_at) if self.lock_expires_at else None,
             "waitlist_reason": self.waitlist_reason,
+            "cancel_reason": self.cancel_reason,
             "version": self.version,
         }
 
@@ -439,6 +482,7 @@ class Booking:
             quote=Quote.from_dict(data["quote"]) if data.get("quote") else None,
             lock_expires_at=dt_from_str(data["lock_expires_at"]) if data.get("lock_expires_at") else None,
             waitlist_reason=data.get("waitlist_reason"),
+            cancel_reason=data.get("cancel_reason"),
             version=int(data.get("version", 0)),
         )
 
@@ -582,6 +626,62 @@ class LossRecord:
             reason=data["reason"],
             recorded_at=dt_from_str(data["recorded_at"]),
             booking_id=data.get("booking_id"),
+        )
+
+
+@dataclass(frozen=True)
+class CompensationAction:
+    """取消补偿计划中的单个动作声明。"""
+
+    action_type: str
+    payload: dict[str, Any] = field(default_factory=dict)
+
+    def to_dict(self) -> dict[str, Any]:
+        return {"action_type": self.action_type, "payload": dict(self.payload)}
+
+
+@dataclass
+class CompensationActionResult:
+    """补偿动作执行结果：每个动作一行，SQLite 持久化，重试时据此跳过已成功者。"""
+
+    result_id: str
+    booking_id: str
+    action_type: str
+    reason: str  # 触发该补偿的取消原因
+    status: str
+    payload: dict[str, Any]
+    result: dict[str, Any]
+    error: str | None
+    attempt: int
+    executed_at: datetime
+
+    def to_dict(self) -> dict[str, Any]:
+        return {
+            "result_id": self.result_id,
+            "booking_id": self.booking_id,
+            "action_type": self.action_type,
+            "reason": self.reason,
+            "status": self.status,
+            "payload": dict(self.payload),
+            "result": dict(self.result),
+            "error": self.error,
+            "attempt": self.attempt,
+            "executed_at": dt_to_str(self.executed_at),
+        }
+
+    @classmethod
+    def from_dict(cls, data: dict[str, Any]) -> "CompensationActionResult":
+        return cls(
+            result_id=data["result_id"],
+            booking_id=data["booking_id"],
+            action_type=data["action_type"],
+            reason=data["reason"],
+            status=data["status"],
+            payload=dict(data.get("payload", {})),
+            result=dict(data.get("result", {})),
+            error=data.get("error"),
+            attempt=int(data.get("attempt", 1)),
+            executed_at=dt_from_str(data["executed_at"]),
         )
 
 
